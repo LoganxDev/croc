@@ -64,6 +64,7 @@ type Options struct {
 	Ask            bool
 	SendingText    bool
 	NoCompress     bool
+	NoReconnect    bool
 }
 
 // Client holds the state of the croc transfer
@@ -452,25 +453,41 @@ func (c *Client) Send(options TransferOptions) (err error) {
 		}
 		c.ExternalIP = ipaddr
 		log.Debug("exchanged header message")
-		errchan <- c.transfer(options)
+
+		// Attempt to transfer a message up three times
+		sendAttempts := 0
+		for sendAttempts < 3 {
+			err = c.transfer(options)
+			if err != nil {
+				sendAttempts++
+				log.Warnf("error during the transfer: %v attempting again", err)
+			} else {
+				break
+			}
+		}
+		if sendAttempts >= 3 {
+			errchan <- err
+		}
 	}()
 
 	err = <-errchan
 	if err == nil {
 		// return if no error
 		return
-	} else {
-		log.Debugf("error from errchan: %v", err)
-		if strings.Contains(err.Error(), "could not secure channel") {
-			return err
-		}
 	}
+
+	log.Debugf("error from errchan: %v", err)
+	if strings.Contains(err.Error(), "could not secure channel") {
+		return err
+	}
+
 	if !c.Options.DisableLocal {
 		if strings.Contains(err.Error(), "refusing files") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "bad password") {
 			errchan <- err
 		}
 		err = <-errchan
 	}
+
 	return err
 }
 
@@ -640,7 +657,22 @@ func (c *Client) Receive() (err error) {
 	}
 	log.Debug("exchanged header message")
 	fmt.Fprintf(os.Stderr, "\rsecuring channel...")
-	return c.transfer(TransferOptions{})
+
+	// Attempt to transfer a message up three times
+	receiveAttempts := 0
+	for receiveAttempts < 3 {
+		err = c.transfer(TransferOptions{})
+		if err != nil {
+			receiveAttempts++
+			log.Warnf("error during the transfer: %v attempting again", err)
+		} else {
+			break
+		}
+	}
+	if receiveAttempts >= 3 {
+		return err
+	}
+	return nil
 }
 
 func (c *Client) transfer(options TransferOptions) (err error) {
@@ -838,11 +870,14 @@ func (c *Client) procesMessagePake(m message.Message) (err error) {
 					fmt.Sprintf("%s-%d", utils.SHA256(c.Options.SharedSecret)[:7], j),
 				)
 				if err != nil {
-					panic(err)
+					return
 				}
 				log.Debugf("connected to %s", server)
 				if !c.Options.IsSender {
-					go c.receiveData(j)
+					err = c.receiveData(j)
+					if err != nil {
+						return
+					}
 				}
 			}(i)
 		}
@@ -1267,7 +1302,10 @@ func (c *Client) updateState() (err error) {
 		}
 		for i := 0; i < len(c.Options.RelayPorts); i++ {
 			log.Debugf("starting sending over comm %d", i)
-			go c.sendData(i)
+			err = c.sendData(i)
+			if err != nil {
+				return
+			}
 		}
 	}
 	return
@@ -1304,7 +1342,7 @@ func (c *Client) setBar() {
 	}
 }
 
-func (c *Client) receiveData(i int) {
+func (c *Client) receiveData(i int) (err error) {
 	log.Debugf("%d receiving data", i)
 	for {
 		data, err := c.conn[i+1].Receive()
@@ -1318,7 +1356,7 @@ func (c *Client) receiveData(i int) {
 
 		data, err = crypt.Decrypt(data, c.Key)
 		if err != nil {
-			panic(err)
+			break
 		}
 		if !c.Options.NoCompress {
 			data = compress.Decompress(data)
@@ -1329,7 +1367,7 @@ func (c *Client) receiveData(i int) {
 		rbuf := bytes.NewReader(data[:8])
 		err = binary.Read(rbuf, binary.LittleEndian, &position)
 		if err != nil {
-			panic(err)
+			break
 		}
 		positionInt64 := int64(position)
 
@@ -1337,7 +1375,7 @@ func (c *Client) receiveData(i int) {
 		_, err = c.CurrentFile.WriteAt(data[8:], positionInt64)
 		c.mutex.Unlock()
 		if err != nil {
-			panic(err)
+			break
 		}
 		c.bar.Add(len(data[8:]))
 		c.TotalSent += int64(len(data[8:]))
@@ -1360,7 +1398,7 @@ func (c *Client) receiveData(i int) {
 				Type: "close-sender",
 			})
 			if err != nil {
-				panic(err)
+				break
 			}
 		}
 	}
@@ -1368,7 +1406,7 @@ func (c *Client) receiveData(i int) {
 	return
 }
 
-func (c *Client) sendData(i int) {
+func (c *Client) sendData(i int) (err error) {
 	defer func() {
 		log.Debugf("finished with %d", i)
 		c.numfinished++
@@ -1424,12 +1462,12 @@ func (c *Client) sendData(i int) {
 					)
 				}
 				if err != nil {
-					panic(err)
+					break
 				}
 
 				err = c.conn[i+1].Send(dataToSend)
 				if err != nil {
-					panic(err)
+					break
 				}
 				c.bar.Add(n)
 				c.TotalSent += int64(n)
@@ -1446,7 +1484,8 @@ func (c *Client) sendData(i int) {
 			if errRead == io.EOF {
 				break
 			}
-			panic(errRead)
+			err = errRead
+			break
 		}
 	}
 	return

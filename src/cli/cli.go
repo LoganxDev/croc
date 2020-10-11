@@ -178,6 +178,7 @@ func send(c *cli.Context) (err error) {
 		RelayPassword:  determinePass(c),
 		SendingText:    c.String("text") != "",
 		NoCompress:     c.Bool("no-compress"),
+		NoReconnect:    c.Bool("no-reconnect"),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
